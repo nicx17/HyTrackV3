@@ -1,4 +1,3 @@
-
 # HyTrackV3: Autonomous Shipment Tracker
 
 **A headless tracking engine that monitors emails, scrapes carrier sites, and sends real-time status notifications.**
@@ -101,14 +100,8 @@ Copy the block below directly into your **README.md**:
 
 HyTrackV3 converts raw courier data into clean, chronological mobile notifications. Below is the actual progression of a shipment as tracked and delivered by the system:
 
-| **1. Order Detected** | **2. Picked Up** | **3. In Transit** |
-| --- | --- | --- |
-| <img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-20-obfuscated" src="https://github.com/user-attachments/assets/bbdecc44-731c-4307-8484-6faed22bd924" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-17-obfuscated" src="https://github.com/user-attachments/assets/ec277659-c6d4-4242-bd23-009733916d8b" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-15-obfuscated" src="https://github.com/user-attachments/assets/2a601dec-518b-406a-853d-40114d5fc5af" /> |
-| **4. Facility Arrival** | **5. Sorting Center** | **6. Processing** |
-| <img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-10-obfuscated" src="https://github.com/user-attachments/assets/0355d68a-dd66-4115-b126-403a1728da46" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-07-obfuscated" src="https://github.com/user-attachments/assets/ce9e98a6-52a5-41c4-8e2c-7556a1815a3b" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-04-obfuscated" src="https://github.com/user-attachments/assets/f429216c-1aaf-42f2-bac6-55553bc3441d" /> |
-| **7. Out for Hub** | **8. Last-Mile Facility** | **9. Local Sorting** |
-|<img width="714" height="876" alt="Screenshot From 2026-02-18 21-03-01-obfuscated" src="https://github.com/user-attachments/assets/70c1ca60-ef29-4b72-8e66-b67241e85484" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-02-58-obfuscated" src="https://github.com/user-attachments/assets/62b2517d-581d-4edd-8d71-e32539380786" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-02-55-obfuscated" src="https://github.com/user-attachments/assets/7f44233b-d811-4a4b-befa-3006ff9d7e3f" /> |
-| **10. Out for Delivery** | **11. Final Mile** | **12. Delivered ✅** |
-| <img width="714" height="876" alt="Screenshot From 2026-02-18 21-02-51-obfuscated" src="https://github.com/user-attachments/assets/70c5071a-8a27-4e6a-9071-bad3baedf38c" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-02-47-obfuscated" src="https://github.com/user-attachments/assets/4545a0e9-4675-4dd5-94f2-0fbbbac3c96d" /> | <img width="714" height="876" alt="Screenshot From 2026-02-18 21-02-40-obfuscated" src="https://github.com/user-attachments/assets/625b6ab4-439c-4794-814a-1a00c1901f29" /> |
+| **1. Order Delivered** | **2. In Transit** | **3. In Transit** | **3. In Transit** |
+| --- | --- | --- | --- |
+| <img width="714" height="876" alt="Screenshot From 2026-02-27 20-22-53-obfuscated" src="https://github.com/user-attachments/assets/a4b09509-fb2e-4d1f-af85-cca9a8f23cc1" /> | <img width="714" height="876" alt="Screenshot From 2026-02-27 20-23-16-obfuscated" src="https://github.com/user-attachments/assets/647c40f1-b6c1-495b-a20c-fe5bf17090db" /> | <img width="714" height="876" alt="Screenshot From 2026-02-27 20-23-32-obfuscated" src="https://github.com/user-attachments/assets/6c220c8f-f5db-48f6-9c03-1e084d223d4d" /> |  <img width="714" height="876" alt="Screenshot From 2026-02-27 20-23-50-obfuscated" src="https://github.com/user-attachments/assets/ccde6a5b-609b-4a4f-8967-4c7d6bcaea68" /> |
 
 ---
