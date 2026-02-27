@@ -1,5 +1,5 @@
 
-# 📦 HyTrackV3: Autonomous Shipment Tracker
+# HyTrackV3: Autonomous Shipment Tracker
 
 **A headless tracking engine that monitors emails, scrapes carrier sites, and sends real-time status notifications.**
 
@@ -7,7 +7,7 @@ HyTrackV3 is designed for users who want a centralized, self-hosted solution to 
 
 ---
 
-## 🛠 Features
+## Features
 
 * **Automatic Discovery:** Scans your Gmail/Outlook inbox for new Blue Dart (11-digit) and Delhivery (12-14 digit) tracking numbers.
 * **Smart Change Detection:** Uses SHA-256 hashing to compare shipment "fingerprints," ensuring you only get notified when the status actually changes.
@@ -20,7 +20,7 @@ HyTrackV3 is designed for users who want a centralized, self-hosted solution to 
 
 ---
 
-## 🏗 System Architecture
+## System Architecture
 
 1. **Ingestion:** Script logs into IMAP server  Extracts waybills via Regex.
 2. **Tracking:** * Blue Dart  `requests` + `BeautifulSoup`.
@@ -32,7 +32,7 @@ HyTrackV3 is designed for users who want a centralized, self-hosted solution to 
 
 ---
 
-## 🚀 Setup & Installation
+## Setup & Installation
 
 ### 1. Prerequisites
 
@@ -69,7 +69,7 @@ pip install -r requirements.txt
 
 ---
 
-## 📦 Database Schema
+## Database Schema
 
 The system manages state using a single-table SQLite database:
 | Column | Type | Description |
@@ -97,7 +97,7 @@ Copy the block below directly into your **README.md**:
 
 ---
 
-## 📱 Live Notification Sequence
+## Live Notification Sequence
 
 HyTrackV3 converts raw courier data into clean, chronological mobile notifications. Below is the actual progression of a shipment as tracked and delivered by the system:
 
