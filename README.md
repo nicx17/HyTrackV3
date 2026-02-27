@@ -80,7 +80,7 @@ The system manages state using a single-table SQLite database:
 
 ---
 
-## 🖥 Deployment (Raspberry Pi 5)
+## Deployment (Raspberry Pi 5)
 
 To run this automatically every hour, add a Cron job:
 
@@ -93,6 +93,24 @@ crontab -e
 Got it. You've provided updated links for the tracking sequence. I've organized them into a clean  grid that flows chronologically from the first detection to the final delivery.
 
 Copy the block below directly into your **README.md**:
+
+---
+
+
+Since this is a solo project, it’s best to keep the tone personal and direct. You want to sound like a developer who is building something useful, rather than a big corporation.
+
+Here is a stripped-down, friendly version you can drop into your README:
+
+---
+
+## It's Live!
+
+The project is finally ready to use.
+
+### How to use it
+
+If you have tracking IDs you want to track or look into, just send them to my email:
+**notify@hyclotron.com** I’m still refining things, so if you run into any bugs or have ideas on how to make it better, definitely let me know!
 
 ---
 
