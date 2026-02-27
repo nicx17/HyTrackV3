@@ -161,28 +161,44 @@ class DatabaseManager:
 
 class BrowserManager:
     """Context manager for initializing and cleaning up a headless Selenium Chrome WebDriver."""
-
+    
     def __init__(self):
         self.driver = None
 
     def __enter__(self):
+        logger.info("Configuring headless Chrome WebDriver environments...")
         options = Options()
-        options.add_argument("--headless=new")
+        
+        # CRITICAL FIX: This must be active to run on a Pi without a display
+        options.add_argument("--headless=new") 
+        
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
-
-        logger.info("Initializing Chrome WebDriver via webdriver_manager")
-        service = Service(ChromeDriverManager().install())
-
+        
+        # Check system architecture
+        import platform
+        arch = platform.machine()
+        
+        # aarch64/arm64 for 64-bit Pi OS, armv7l for 32-bit Pi OS
+        if arch in ['aarch64', 'arm64', 'armv7l']:
+            logger.info(f"ARM architecture ({arch}) detected. Using system ChromeDriver.")
+            
+            # Use standard Pi OS binary paths
+            options.binary_location = '/usr/bin/chromium-browser' 
+            service = Service('/usr/bin/chromedriver')
+        else:
+            logger.debug(f"x86 architecture ({arch}) detected. Installing via webdriver_manager...")
+            service = Service(ChromeDriverManager().install())
+        
         self.driver = webdriver.Chrome(service=service, options=options)
-        logger.info("Chrome WebDriver ready")
+        logger.info("Chrome WebDriver initialized and ready for scraping.")
         return self.driver
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.driver is not None:
-            logger.info("Closing Chrome WebDriver")
+            logger.info("Tearing down Chrome WebDriver session.")
             self.driver.quit()
 
 
