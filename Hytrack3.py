@@ -206,6 +206,7 @@ class BrowserManager:
             logger.info("Tearing down Chrome WebDriver session.")
             self.driver.quit()
 
+
 class BlueDartTracker:
     """Tracker implementation for fetching Blue Dart shipment statuses."""
 
