@@ -548,7 +548,7 @@ def build_html_message(waybill, event):
 
                     <a href="{link}" class="action-btn">Track live update ↗</a>
                 </div>
-                <div class="footer">HYTRACK LOGISTICS INTELLIGENCE</div>
+                <div class="footer">HYTRACK</div>
             </div>
         </div>
     </body>
