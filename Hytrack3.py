@@ -257,7 +257,6 @@ class BlueDartTracker:
             logger.exception("Blue Dart fetch failed: waybill=%s", self.waybill)
             return None
 
-
 class DelhiveryTracker:
     """Tracker implementation for fetching Delhivery shipment statuses using Selenium."""
 
