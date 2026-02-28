@@ -2,6 +2,8 @@ import imaplib
 import email
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import smtplib
 import os
 import logging
@@ -29,6 +31,8 @@ class Config:
     """Configuration class to manage environment variables and application constants."""
 
     load_dotenv()
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
     IMAP_SERVER = os.getenv("IMAP_SERVER")
     IMAP_PORT = int(os.getenv("IMAP_PORT", 993))
     EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
@@ -37,8 +41,8 @@ class Config:
     SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
     RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
-    DB_FILE = "hytrack3.db"
-    LOG_FILE = "hytrack3.log"
+    DB_FILE = os.path.join(BASE_DIR, "hytrack3.db")
+    LOG_FILE = os.path.join(BASE_DIR, "hytrack3.log")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
     REGEX_BLUEDART = r"\b\d{11}\b"
@@ -89,74 +93,71 @@ class DatabaseManager:
 
     def setup(self):
         """Initializes database schema and handles necessary migrations."""
-        with self as db:
-            cursor = db.conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor = self.conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
 
-            cursor.execute(
-                """
-            CREATE TABLE IF NOT EXISTS shipments (
-                waybill TEXT PRIMARY KEY,
-                courier TEXT, 
-                last_event_hash TEXT,
-                is_delivered INTEGER NOT NULL DEFAULT 0,
-                recipient_email TEXT,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+        cursor.execute(
             """
-            )
-            logger.info("Database table 'shipments' initialized")
+        CREATE TABLE IF NOT EXISTS shipments (
+            waybill TEXT PRIMARY KEY,
+            courier TEXT, 
+            last_event_hash TEXT,
+            is_delivered INTEGER NOT NULL DEFAULT 0,
+            recipient_email TEXT,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+        )
+        logger.info("Database table 'shipments' initialized")
 
-            cursor.execute("PRAGMA table_info(shipments)")
-            columns = [column[1] for column in cursor.fetchall()]
-            if "recipient_email" not in columns:
-                logger.warning("Migrating database: adding recipient_email column")
-                cursor.execute("ALTER TABLE shipments ADD COLUMN recipient_email TEXT")
-                logger.info("Database migration completed")
+        cursor.execute("PRAGMA table_info(shipments)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if "recipient_email" not in columns:
+            logger.warning("Migrating database: adding recipient_email column")
+            cursor.execute("ALTER TABLE shipments ADD COLUMN recipient_email TEXT")
+            logger.info("Database migration completed")
 
-            db.conn.commit()
+        self.conn.commit()
 
     def add_waybill(self, waybill, courier_type, recipient_email):
         """Inserts a new waybill or updates an existing one to mark it as undelivered."""
-        with self as db:
-            query = """
-                INSERT INTO shipments (waybill, courier, recipient_email, is_delivered) 
-                VALUES (?, ?, ?, 0)
-                ON CONFLICT(waybill) DO UPDATE SET 
-                    is_delivered = 0,
-                    recipient_email = excluded.recipient_email,
-                    last_updated = CURRENT_TIMESTAMP
-            """
-            db.conn.cursor().execute(query, (waybill, courier_type, recipient_email))
-            db.conn.commit()
-            logger.info(
-                "Tracked waybill (New/Updated): courier=%s waybill=%s recipient=%s",
-                courier_type,
-                waybill,
-                recipient_email,
-            )
+        query = """
+            INSERT INTO shipments (waybill, courier, recipient_email, is_delivered) 
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(waybill) DO UPDATE SET 
+                last_event_hash = CASE WHEN is_delivered = 1 THEN NULL ELSE last_event_hash END,
+                is_delivered = 0,
+                recipient_email = excluded.recipient_email,
+                last_updated = CURRENT_TIMESTAMP
+        """
+        self.conn.cursor().execute(query, (waybill, courier_type, recipient_email))
+        self.conn.commit()
+        logger.info(
+            "Tracked waybill (New/Updated): courier=%s waybill=%s recipient=%s",
+            courier_type,
+            waybill,
+            recipient_email,
+        )
 
     def get_active_shipments(self):
         """Retrieves all shipments that are currently in transit."""
-        with self as db:
-            cursor = db.conn.cursor()
-            cursor.execute(
-                "SELECT waybill, courier, last_event_hash, recipient_email FROM shipments WHERE is_delivered = 0"
-            )
-            return cursor.fetchall()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT waybill, courier, last_event_hash, recipient_email FROM shipments WHERE is_delivered = 0"
+        )
+        return cursor.fetchall()
 
     def update_shipment(self, waybill, event_hash, is_delivered=False):
         """Updates the tracking status hash and delivery state for a specific waybill."""
-        with self as db:
-            db.conn.cursor().execute(
-                """
-            UPDATE shipments
-            SET last_event_hash = ?, is_delivered = ?, last_updated = CURRENT_TIMESTAMP
-            WHERE waybill = ?
-            """,
-                (event_hash, 1 if is_delivered else 0, waybill),
-            )
-            db.conn.commit()
+        self.conn.cursor().execute(
+            """
+        UPDATE shipments
+        SET last_event_hash = ?, is_delivered = ?, last_updated = CURRENT_TIMESTAMP
+        WHERE waybill = ?
+        """,
+            (event_hash, 1 if is_delivered else 0, waybill),
+        )
+        self.conn.commit()
 
 
 class BrowserManager:
@@ -210,15 +211,28 @@ class BrowserManager:
 class BlueDartTracker:
     """Tracker implementation for fetching Blue Dart shipment statuses."""
 
-    def __init__(self, waybill):
+    def __init__(self, waybill, session=None):
         self.waybill = waybill
         self.url = f"https://www.bluedart.com/trackdartresultthirdparty?trackFor=0&trackNo={waybill}"
+
+        if session:
+            self.session = session
+        else:
+            # Initialize session with retry mechanism
+            self.session = requests.Session()
+            retries = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+            )
+            self.session.mount("https://", HTTPAdapter(max_retries=retries))
+            self.session.mount("http://", HTTPAdapter(max_retries=retries))
 
     def fetch_latest_event(self, **kwargs):
         """Fetches and parses the latest tracking event from Blue Dart."""
         try:
             logger.debug("Fetching Blue Dart status: waybill=%s", self.waybill)
-            response = requests.get(
+            response = self.session.get(
                 self.url,
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=Config.REQUEST_TIMEOUT,
@@ -257,6 +271,7 @@ class BlueDartTracker:
             logger.exception("Blue Dart fetch failed: waybill=%s", self.waybill)
             return None
 
+
 class DelhiveryTracker:
     """Tracker implementation for fetching Delhivery shipment statuses using Selenium."""
 
@@ -276,14 +291,15 @@ class DelhiveryTracker:
 
             wait = WebDriverWait(driver, 25)
 
-            try:
-                # Check for delivery confirmation success card
-                delivered_header_xpath = "//h2[contains(text(), 'Order Delivered')]"
-                wait_short = WebDriverWait(driver, 5)
-                delivered_card = wait_short.until(
-                    EC.presence_of_element_located((By.XPATH, delivered_header_xpath))
-                )
+            # Use an OR XPath query to wait for EITHER the delivery card OR the active timeline ping.
+            # This drastically reduces scraping time for in-transit shipments by removing artificial timeouts.
+            delivered_header_xpath = "//h2[contains(text(), 'Order Delivered')]"
+            dot_xpath = "//span[contains(@class, 'animate-ping')]"
+            combined_xpath = f"{delivered_header_xpath} | {dot_xpath}"
 
+            wait.until(EC.presence_of_element_located((By.XPATH, combined_xpath)))
+
+            if driver.find_elements(By.XPATH, delivered_header_xpath):
                 logger.info("Delivered status card detected: waybill=%s", self.waybill)
                 return {
                     "Courier": "Delhivery",
@@ -293,16 +309,8 @@ class DelhiveryTracker:
                     "Time": datetime.now().strftime("%H:%M"),
                     "Link": self.url,
                 }
-            except TimeoutException:
-                logger.debug(
-                    "No delivery card found; checking active timeline: waybill=%s",
-                    self.waybill,
-                )
 
-            # Check for active timeline (In-Transit states)
-            dot_xpath = "//span[contains(@class, 'animate-ping')]"
-            wait.until(EC.presence_of_element_located((By.XPATH, dot_xpath)))
-
+            # If not delivered, parsing active timeline (In-Transit states)
             row = driver.find_element(
                 By.XPATH,
                 f"{dot_xpath}/ancestor::div[contains(@class, 'flex') and contains(@class, 'gap-4')][1]",
@@ -317,7 +325,7 @@ class DelhiveryTracker:
                     By.XPATH,
                     ".//div[contains(@class, 'text-[#525B7A]') or contains(@class, 'font-[400]')]",
                 ).text.strip()
-            except:
+            except Exception:
                 desc = "Update available"
 
             return {
@@ -346,11 +354,25 @@ class EmailService:
             for part in msg.walk():
                 if part.get_content_type() == "text/plain":
                     return part.get_payload(decode=True).decode(errors="ignore")
-        return msg.get_payload(decode=True).decode(errors="ignore")
 
-    def fetch_new_waybills(self):
+            # Fallback for HTML-only multipart messages
+            for part in msg.walk():
+                if part.get_content_type() == "text/html":
+                    html_content = part.get_payload(decode=True).decode(errors="ignore")
+                    return BeautifulSoup(html_content, "html.parser").get_text(
+                        separator=" "
+                    )
+            return ""
+
+        # Handle non-multipart emails natively
+        payload = msg.get_payload(decode=True).decode(errors="ignore")
+        if msg.get_content_type() == "text/html":
+            return BeautifulSoup(payload, "html.parser").get_text(separator=" ")
+        return payload
+
+    def fetch_new_waybills(self, db):
         """Scans unread emails to extract Blue Dart and Delhivery waybills using regex."""
-        found_data = []
+        found_data = []  # Just for memory logging
         try:
             logger.info("Connecting to IMAP server")
             mail = imaplib.IMAP4_SSL(Config.IMAP_SERVER, Config.IMAP_PORT)
@@ -381,24 +403,34 @@ class EmailService:
                 bd_waybills = re.findall(Config.REGEX_BLUEDART, content)
                 dh_waybills = re.findall(Config.REGEX_DELHIVERY, content)
 
+                # Check for uniqueness to avoid sending to db duplicate queries
+                wb_set_for_msg = set()
+
                 for wb in bd_waybills:
-                    found_data.append((wb, "BLUEDART", sender_email))
-                    logger.debug(
-                        "Extracted Blue Dart waybill: waybill=%s sender=%s",
-                        wb,
-                        sender_email,
-                    )
+                    if wb not in wb_set_for_msg:
+                        wb_set_for_msg.add(wb)
+                        found_data.append((wb, "BLUEDART", sender_email))
+                        db.add_waybill(wb, "BLUEDART", sender_email)
+                        logger.debug(
+                            "Extracted Blue Dart waybill: waybill=%s sender=%s",
+                            wb,
+                            sender_email,
+                        )
 
                 for wb in dh_waybills:
-                    if not any(wb == x[0] for x in found_data):
+                    if wb not in wb_set_for_msg:
+                        wb_set_for_msg.add(wb)
                         found_data.append((wb, "DELHIVERY", sender_email))
+                        db.add_waybill(wb, "DELHIVERY", sender_email)
                         logger.debug(
                             "Extracted Delhivery waybill: waybill=%s sender=%s",
                             wb,
                             sender_email,
                         )
 
+                # Mark as seen ONLY AFTER the DB records have been stored!
                 mail.store(num, "+FLAGS", "\\Seen")
+
             mail.logout()
             logger.info("Email scan complete: extracted_waybills=%s", len(found_data))
         except Exception:
@@ -439,7 +471,13 @@ def build_html_message(waybill, event):
     time = event.get("Time", "")
     link = event.get("Link", "#")
 
-    is_delivered = "delivered" in details.lower()
+    del_txt = details.lower()
+    is_delivered = (
+        "delivered" in del_txt
+        and "failed" not in del_txt
+        and "unable" not in del_txt
+        and "out for delivery" not in del_txt
+    )
 
     bg_charcoal = "#171717"
     card_bg = "#212121"
@@ -582,7 +620,15 @@ def process_shipment(row, tracker, db, email_service, **kwargs):
             waybill,
             target_recipient,
         )
-        is_delivered = "delivered" in event["Details"].lower()
+
+        del_txt = event["Details"].lower()
+        is_delivered = (
+            "delivered" in del_txt
+            and "failed" not in del_txt
+            and "unable" not in del_txt
+            and "out for delivery" not in del_txt
+        )
+
         status_text = "Delivered" if is_delivered else "In Transit"
         subject = f"{status_text} | {event['Courier']} | {waybill}"
 
@@ -609,56 +655,63 @@ def main():
     logger.info("Starting shipment tracker")
     logger.info("=" * 60)
 
-    db = DatabaseManager(Config.DB_FILE)
-    email_service = EmailService()
-    db.setup()
+    # Database connection managed for the whole execution
+    with DatabaseManager(Config.DB_FILE) as db:
+        email_service = EmailService()
+        db.setup()
 
-    logger.info("Phase 1/4: Email ingestion")
-    new_items = email_service.fetch_new_waybills()
-    for wb, courier, sender in new_items:
-        if sender:
-            db.add_waybill(wb, courier, sender)
+        logger.info("Phase 1/4: Email ingestion")
+        # Db records are stored within this method securely before seen flags are toggled
+        email_service.fetch_new_waybills(db)
 
-    logger.info("Phase 2/4: Retrieve active shipments")
-    with db as conn:
-        cursor = conn.conn.cursor()
-        cursor.execute(
-            "SELECT waybill, courier, last_event_hash, recipient_email FROM shipments WHERE is_delivered = 0"
-        )
-        active = cursor.fetchall()
+        logger.info("Phase 2/4: Retrieve active shipments")
+        active = db.get_active_shipments()
 
-    if not active:
-        logger.info("No active shipments to track")
-        logger.info("=" * 60)
-        logger.info("Tracker completed successfully")
-        return
+        if not active:
+            logger.info("No active shipments to track")
+            logger.info("=" * 60)
+            logger.info("Tracker completed successfully")
+            return
 
-    logger.info("Active shipments to process: count=%s", len(active))
+        logger.info("Active shipments to process: count=%s", len(active))
 
-    logger.info("Phase 3/4: Process Blue Dart shipments")
-    bd_rows = [s for s in active if s["courier"] == "BLUEDART"]
-    if bd_rows:
-        logger.info("Processing Blue Dart shipments: count=%s", len(bd_rows))
-        for row in bd_rows:
-            process_shipment(row, BlueDartTracker(row["waybill"]), db, email_service)
-    else:
-        logger.info("No Blue Dart shipments")
+        logger.info("Phase 3/4: Process Blue Dart shipments")
+        bd_rows = [s for s in active if s["courier"] == "BLUEDART"]
+        if bd_rows:
+            logger.info("Processing Blue Dart shipments: count=%s", len(bd_rows))
 
-    logger.info("Phase 4/4: Process Delhivery shipments")
-    dl_rows = [s for s in active if s["courier"] == "DELHIVERY"]
-    if dl_rows:
-        logger.info("Processing Delhivery shipments: count=%s", len(dl_rows))
-        with BrowserManager() as driver:
-            for row in dl_rows:
+            # Setup shared session for efficiency
+            bd_session = requests.Session()
+            retries = Retry(
+                total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]
+            )
+            bd_session.mount("https://", HTTPAdapter(max_retries=retries))
+
+            for row in bd_rows:
                 process_shipment(
                     row,
-                    DelhiveryTracker(row["waybill"]),
+                    BlueDartTracker(row["waybill"], session=bd_session),
                     db,
                     email_service,
-                    driver=driver,
                 )
-    else:
-        logger.info("No Delhivery shipments")
+        else:
+            logger.info("No Blue Dart shipments")
+
+        logger.info("Phase 4/4: Process Delhivery shipments")
+        dl_rows = [s for s in active if s["courier"] == "DELHIVERY"]
+        if dl_rows:
+            logger.info("Processing Delhivery shipments: count=%s", len(dl_rows))
+            with BrowserManager() as driver:
+                for row in dl_rows:
+                    process_shipment(
+                        row,
+                        DelhiveryTracker(row["waybill"]),
+                        db,
+                        email_service,
+                        driver=driver,
+                    )
+        else:
+            logger.info("No Delhivery shipments")
 
     logger.info("=" * 60)
     logger.info("Tracker completed successfully")

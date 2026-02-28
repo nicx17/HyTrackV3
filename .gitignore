@@ -1,3 +1,5 @@
 .env
 hytrack3.db
 hytrack3.log
+hytrack3.db-wal
+hytrack3.db-shm
