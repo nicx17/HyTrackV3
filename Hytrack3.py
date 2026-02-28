@@ -166,44 +166,23 @@ class BrowserManager:
         self.driver = None
 
     def __enter__(self):
-        logger.info("Configuring headless Chrome WebDriver environments...")
         options = Options()
-
-        # CRITICAL FIX: This must be active to run on a Pi without a display
         options.add_argument("--headless=new")
-
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
         options.add_argument("--window-size=1920,1080")
 
-        # Check system architecture
-        import platform
-
-        arch = platform.machine()
-
-        # aarch64/arm64 for 64-bit Pi OS, armv7l for 32-bit Pi OS
-        if arch in ["aarch64", "arm64", "armv7l"]:
-            logger.info(
-                f"ARM architecture ({arch}) detected. Using system ChromeDriver."
-            )
-
-            # Use standard Pi OS binary paths
-            options.binary_location = "/usr/bin/chromium-browser"
-            service = Service("/usr/bin/chromedriver")
-        else:
-            logger.debug(
-                f"x86 architecture ({arch}) detected. Installing via webdriver_manager..."
-            )
-            service = Service(ChromeDriverManager().install())
+        logger.info("Initializing Chrome WebDriver via webdriver_manager")
+        service = Service(ChromeDriverManager().install())
 
         self.driver = webdriver.Chrome(service=service, options=options)
-        logger.info("Chrome WebDriver initialized and ready for scraping.")
+        logger.info("Chrome WebDriver ready")
         return self.driver
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.driver is not None:
-            logger.info("Tearing down Chrome WebDriver session.")
+            logger.info("Closing Chrome WebDriver")
             self.driver.quit()
 
 
@@ -256,6 +235,7 @@ class BlueDartTracker:
         except Exception:
             logger.exception("Blue Dart fetch failed: waybill=%s", self.waybill)
             return None
+
 
 class DelhiveryTracker:
     """Tracker implementation for fetching Delhivery shipment statuses using Selenium."""
@@ -341,12 +321,38 @@ class EmailService:
         self.config = Config()
 
     def _get_email_content(self, msg):
-        """Extracts plain text content from a potentially multipart email message."""
+        """Extracts text content from a potentially multipart email message, including HTML stripping."""
+        content = ""
+
         if msg.is_multipart():
             for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    return part.get_payload(decode=True).decode(errors="ignore")
-        return msg.get_payload(decode=True).decode(errors="ignore")
+                content_type = part.get_content_type()
+                content_disposition = str(part.get("Content-Disposition"))
+
+                if "attachment" in content_disposition:
+                    continue
+
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+
+                decoded = payload.decode(errors="ignore")
+                if content_type == "text/plain":
+                    content += decoded + " "
+                elif content_type == "text/html":
+                    soup = BeautifulSoup(decoded, "html.parser")
+                    content += soup.get_text(separator=" ") + " "
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                decoded = payload.decode(errors="ignore")
+                if msg.get_content_type() == "text/html":
+                    soup = BeautifulSoup(decoded, "html.parser")
+                    content = soup.get_text(separator=" ")
+                else:
+                    content = decoded
+
+        return content
 
     def fetch_new_waybills(self):
         """Scans unread emails to extract Blue Dart and Delhivery waybills using regex."""
@@ -548,7 +554,7 @@ def build_html_message(waybill, event):
 
                     <a href="{link}" class="action-btn">Track live update ↗</a>
                 </div>
-                <div class="footer">HYTRACK</div>
+                <div class="footer">HYTRACK LOGISTICS INTELLIGENCE</div>
             </div>
         </div>
     </body>
