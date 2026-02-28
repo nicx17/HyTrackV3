@@ -120,15 +120,14 @@ class DatabaseManager:
         self.conn.commit()
 
     def add_waybill(self, waybill, courier_type, recipient_email):
-        """Inserts a new waybill or updates an existing one to mark it as undelivered."""
+        """Inserts a new waybill. If it exists and is already delivered, it is ignored."""
         query = """
             INSERT INTO shipments (waybill, courier, recipient_email, is_delivered) 
             VALUES (?, ?, ?, 0)
             ON CONFLICT(waybill) DO UPDATE SET 
-                last_event_hash = CASE WHEN is_delivered = 1 THEN NULL ELSE last_event_hash END,
-                is_delivered = 0,
                 recipient_email = excluded.recipient_email,
                 last_updated = CURRENT_TIMESTAMP
+            WHERE is_delivered = 0
         """
         self.conn.cursor().execute(query, (waybill, courier_type, recipient_email))
         self.conn.commit()
