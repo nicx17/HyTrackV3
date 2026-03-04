@@ -1,3 +1,16 @@
+"""
+HyTrackV3 - Automated Logistics Tracker
+
+This application connects to an IMAP server to fetch delivery tracking numbers (Blue Dart, Delhivery)
+from emails, tracks their status using Selenium and Requests, and sends email notifications upon
+status updates. It maintains a local SQLite database of active shipments.
+
+Usage:
+    python Hytrack3.py
+
+Environment Variables:
+    See sample.env.txt for required configuration.
+"""
 import imaplib
 import email
 import re
