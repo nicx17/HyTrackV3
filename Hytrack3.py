@@ -14,6 +14,8 @@ Environment Variables:
 import imaplib
 import email
 import re
+from html import escape
+import ssl
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -23,11 +25,12 @@ import logging
 import sqlite3
 import hashlib
 from datetime import datetime
+from typing import Optional
 from bs4 import BeautifulSoup
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver import Chrome as SeleniumChrome
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -60,7 +63,18 @@ class Config:
 
     REGEX_BLUEDART = r"\b\d{11}\b"
     REGEX_DELHIVERY = r"\b\d{12,14}\b"
+    HTML_PARSER = "html.parser"
+    TRACKING_EVENT_FIELDS = ("Courier", "Location", "Details", "Date", "Time", "Link")
     REQUEST_TIMEOUT = 15
+    SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", 30))
+
+    @classmethod
+    def get_required_str(cls, setting_name: str) -> str:
+        """Returns a required string config value with type-safe validation."""
+        value = getattr(cls, setting_name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"CRITICAL: Missing environment variable in .env: {setting_name}")
+        return value
 
     @classmethod
     def validate(cls):
@@ -93,20 +107,29 @@ class DatabaseManager:
 
     def __init__(self, db_file):
         self.db_file = db_file
-        self.conn = None
+        self.conn: Optional[sqlite3.Connection] = None
 
-    def __enter__(self):
-        self.conn = sqlite3.connect(self.db_file)
-        self.conn.row_factory = sqlite3.Row
+    def __enter__(self) -> "DatabaseManager":
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        self.conn = conn
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
             self.conn.close()
 
+    def _get_connection(self) -> sqlite3.Connection:
+        """Returns the active database connection or raises if not initialized."""
+        conn = self.conn
+        if conn is None:
+            raise RuntimeError("Database connection has not been initialized")
+        return conn
+
     def setup(self):
         """Initializes database schema and handles necessary migrations."""
-        cursor = self.conn.cursor()
+        conn = self._get_connection()
+        cursor = conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL;")
 
         cursor.execute(
@@ -130,7 +153,7 @@ class DatabaseManager:
             cursor.execute("ALTER TABLE shipments ADD COLUMN recipient_email TEXT")
             logger.info("Database migration completed")
 
-        self.conn.commit()
+        conn.commit()
 
     def add_waybill(self, waybill, courier_type, recipient_email):
         """Inserts a new waybill. If it exists and is already delivered, it is ignored."""
@@ -142,8 +165,9 @@ class DatabaseManager:
                 last_updated = CURRENT_TIMESTAMP
             WHERE is_delivered = 0
         """
-        self.conn.cursor().execute(query, (waybill, courier_type, recipient_email))
-        self.conn.commit()
+        conn = self._get_connection()
+        conn.cursor().execute(query, (waybill, courier_type, recipient_email))
+        conn.commit()
         logger.info(
             "Tracked waybill (New/Updated): courier=%s waybill=%s recipient=%s",
             courier_type,
@@ -153,7 +177,7 @@ class DatabaseManager:
 
     def get_active_shipments(self):
         """Retrieves all shipments that are currently in transit."""
-        cursor = self.conn.cursor()
+        cursor = self._get_connection().cursor()
         cursor.execute(
             "SELECT waybill, courier, last_event_hash, recipient_email FROM shipments WHERE is_delivered = 0"
         )
@@ -161,7 +185,8 @@ class DatabaseManager:
 
     def update_shipment(self, waybill, event_hash, is_delivered=False):
         """Updates the tracking status hash and delivery state for a specific waybill."""
-        self.conn.cursor().execute(
+        conn = self._get_connection()
+        conn.cursor().execute(
             """
         UPDATE shipments
         SET last_event_hash = ?, is_delivered = ?, last_updated = CURRENT_TIMESTAMP
@@ -169,7 +194,7 @@ class DatabaseManager:
         """,
             (event_hash, 1 if is_delivered else 0, waybill),
         )
-        self.conn.commit()
+        conn.commit()
 
 
 class BrowserManager:
@@ -180,7 +205,7 @@ class BrowserManager:
 
     def __enter__(self):
         logger.info("Configuring headless Chrome WebDriver environments...")
-        options = Options()
+        options = ChromeOptions()
 
         # CRITICAL FIX: This must be active to run on a Pi without a display
         options.add_argument("--headless=new")
@@ -203,14 +228,14 @@ class BrowserManager:
 
             # Use standard Pi OS binary paths
             options.binary_location = "/usr/bin/chromium-browser"
-            service = Service("/usr/bin/chromedriver")
+            service = ChromeService("/usr/bin/chromedriver")
         else:
             logger.debug(
                 f"x86 architecture ({arch}) detected. Installing via webdriver_manager..."
             )
-            service = Service(ChromeDriverManager().install())
+            service = ChromeService(ChromeDriverManager().install())
 
-        self.driver = webdriver.Chrome(service=service, options=options)
+        self.driver = SeleniumChrome(service=service, options=options)
         logger.info("Chrome WebDriver initialized and ready for scraping.")
         return self.driver
 
@@ -257,7 +282,7 @@ class BlueDartTracker:
                 )
                 return None
 
-            soup = BeautifulSoup(response.text, "html.parser")
+            soup = BeautifulSoup(response.text, Config.HTML_PARSER)
             container = soup.find("div", id=f"SCAN{self.waybill}")
             if not container:
                 logger.warning(
@@ -265,8 +290,23 @@ class BlueDartTracker:
                 )
                 return None
 
-            row = container.find("table").find("tbody").find_all("tr")[0]
-            cols = row.find_all("td")
+            table = container.find("table")
+            tbody = table.find("tbody") if table else None
+            rows = tbody.find_all("tr") if tbody else []
+            if not rows:
+                logger.warning(
+                    "Blue Dart tracking table missing rows: waybill=%s", self.waybill
+                )
+                return None
+
+            cols = rows[0].find_all("td")
+            if len(cols) < 4:
+                logger.warning(
+                    "Blue Dart tracking row is incomplete: waybill=%s columns=%s",
+                    self.waybill,
+                    len(cols),
+                )
+                return None
 
             logger.debug(
                 "Blue Dart status parsed successfully: waybill=%s", self.waybill
@@ -360,35 +400,108 @@ class EmailService:
     def __init__(self):
         self.config = Config()
 
+    @staticmethod
+    def _decode_payload(part):
+        """Decodes an email part payload safely, returning an empty string if absent."""
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            return ""
+        return payload.decode(errors="ignore")
+
     def _get_email_content(self, msg):
         """Extracts plain text content from a potentially multipart email message."""
         if msg.is_multipart():
             for part in msg.walk():
                 if part.get_content_type() == "text/plain":
-                    return part.get_payload(decode=True).decode(errors="ignore")
+                    return self._decode_payload(part)
 
             # Fallback for HTML-only multipart messages
             for part in msg.walk():
                 if part.get_content_type() == "text/html":
-                    html_content = part.get_payload(decode=True).decode(errors="ignore")
-                    return BeautifulSoup(html_content, "html.parser").get_text(
+                    html_content = self._decode_payload(part)
+                    return BeautifulSoup(html_content, Config.HTML_PARSER).get_text(
                         separator=" "
                     )
             return ""
 
         # Handle non-multipart emails natively
-        payload = msg.get_payload(decode=True).decode(errors="ignore")
+        payload = self._decode_payload(msg)
         if msg.get_content_type() == "text/html":
-            return BeautifulSoup(payload, "html.parser").get_text(separator=" ")
+            return BeautifulSoup(payload, Config.HTML_PARSER).get_text(separator=" ")
         return payload
+
+    def _add_unique_waybills(
+        self, found_data, db, waybills, courier_type, sender_email, seen_waybills
+    ):
+        """Stores unique waybills from a single message and logs each new entry."""
+        for waybill in waybills:
+            if waybill in seen_waybills:
+                continue
+
+            seen_waybills.add(waybill)
+            found_data.append((waybill, courier_type, sender_email))
+            db.add_waybill(waybill, courier_type, sender_email)
+            logger.debug(
+                "Extracted %s waybill: waybill=%s sender=%s",
+                courier_type.title(),
+                waybill,
+                sender_email,
+            )
+
+    def _process_unseen_message(self, mail, num, db, found_data):
+        """Extracts and stores any new waybills found in a single unseen message."""
+        status, msg_data = mail.fetch(num, "(RFC822)")
+        if status != "OK" or not msg_data or not msg_data[0]:
+            logger.warning("Unable to fetch unseen email: message_id=%s", num.decode())
+            return
+
+        msg = email.message_from_bytes(msg_data[0][1])
+
+        sender_raw = msg.get("From", "")
+        _, parsed_email = parseaddr(sender_raw)
+
+        # Fallback to configured recipient if sender email parsing fails
+        sender_email = parsed_email if parsed_email else Config.RECIPIENT_EMAIL
+
+        content = self._get_email_content(msg)
+        seen_waybills = set()
+
+        self._add_unique_waybills(
+            found_data,
+            db,
+            re.findall(Config.REGEX_BLUEDART, content),
+            "BLUEDART",
+            sender_email,
+            seen_waybills,
+        )
+        self._add_unique_waybills(
+            found_data,
+            db,
+            re.findall(Config.REGEX_DELHIVERY, content),
+            "DELHIVERY",
+            sender_email,
+            seen_waybills,
+        )
+
+        # Mark as seen ONLY AFTER the DB records have been stored!
+        mail.store(num, "+FLAGS", "\\Seen")
 
     def fetch_new_waybills(self, db):
         """Scans unread emails to extract Blue Dart and Delhivery waybills using regex."""
         found_data = []  # Just for memory logging
+        mail = None
         try:
+            imap_server = Config.get_required_str("IMAP_SERVER")
+            email_address = Config.get_required_str("EMAIL_ADDRESS")
+            email_password = Config.get_required_str("EMAIL_PASSWORD")
+            ssl_context = ssl.create_default_context()
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+
             logger.info("Connecting to IMAP server")
-            mail = imaplib.IMAP4_SSL(Config.IMAP_SERVER, Config.IMAP_PORT)
-            mail.login(Config.EMAIL_ADDRESS, Config.EMAIL_PASSWORD)
+            mail = imaplib.IMAP4_SSL(
+                imap_server, Config.IMAP_PORT, ssl_context=ssl_context
+            )
+            mail.login(email_address, email_password)
             logger.info("IMAP authentication successful")
             mail.select("INBOX")
 
@@ -401,59 +514,27 @@ class EmailService:
             logger.info("Found unseen emails: count=%s", unseen_count)
 
             for num in messages[0].split():
-                _, msg_data = mail.fetch(num, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1])
+                self._process_unseen_message(mail, num, db, found_data)
 
-                sender_raw = msg.get("From", "")
-                sender_name, parsed_email = parseaddr(sender_raw)
-
-                # Fallback to configured recipient if sender email parsing fails
-                sender_email = parsed_email if parsed_email else Config.RECIPIENT_EMAIL
-
-                content = self._get_email_content(msg)
-
-                bd_waybills = re.findall(Config.REGEX_BLUEDART, content)
-                dh_waybills = re.findall(Config.REGEX_DELHIVERY, content)
-
-                # Check for uniqueness to avoid sending to db duplicate queries
-                wb_set_for_msg = set()
-
-                for wb in bd_waybills:
-                    if wb not in wb_set_for_msg:
-                        wb_set_for_msg.add(wb)
-                        found_data.append((wb, "BLUEDART", sender_email))
-                        db.add_waybill(wb, "BLUEDART", sender_email)
-                        logger.debug(
-                            "Extracted Blue Dart waybill: waybill=%s sender=%s",
-                            wb,
-                            sender_email,
-                        )
-
-                for wb in dh_waybills:
-                    if wb not in wb_set_for_msg:
-                        wb_set_for_msg.add(wb)
-                        found_data.append((wb, "DELHIVERY", sender_email))
-                        db.add_waybill(wb, "DELHIVERY", sender_email)
-                        logger.debug(
-                            "Extracted Delhivery waybill: waybill=%s sender=%s",
-                            wb,
-                            sender_email,
-                        )
-
-                # Mark as seen ONLY AFTER the DB records have been stored!
-                mail.store(num, "+FLAGS", "\\Seen")
-
-            mail.logout()
             logger.info("Email scan complete: extracted_waybills=%s", len(found_data))
         except Exception:
             logger.exception("IMAP fetch failed")
+        finally:
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    logger.debug("IMAP logout failed during cleanup", exc_info=True)
         return found_data
 
     def send_notification(self, recipient, subject, html_content):
         """Constructs and sends an HTML notification email via SMTP."""
+        email_address = Config.get_required_str("EMAIL_ADDRESS")
+        email_password = Config.get_required_str("EMAIL_PASSWORD")
+        smtp_server = Config.get_required_str("SMTP_SERVER")
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
-        msg["From"] = Config.EMAIL_ADDRESS
+        msg["From"] = email_address
         msg["To"] = recipient
         msg.attach(MIMEText(html_content, "html"))
 
@@ -461,10 +542,24 @@ class EmailService:
             logger.debug(
                 "Connecting to SMTP server: recipient=%s subject=%s", recipient, subject
             )
-            with smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT) as server:
-                server.starttls()
-                server.login(Config.EMAIL_ADDRESS, Config.EMAIL_PASSWORD)
-                server.sendmail(Config.EMAIL_ADDRESS, recipient, msg.as_string())
+            with smtplib.SMTP(
+                smtp_server, Config.SMTP_PORT, timeout=Config.SMTP_TIMEOUT
+            ) as server:
+                server.ehlo()
+                if not server.has_extn("STARTTLS"):
+                    logger.error(
+                        "SMTP server does not support STARTTLS: server=%s port=%s",
+                        smtp_server,
+                        Config.SMTP_PORT,
+                    )
+                    return
+
+                tls_context = ssl.create_default_context()
+                tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+                server.starttls(context=tls_context)
+                server.ehlo()
+                server.login(email_address, email_password)
+                server.sendmail(email_address, recipient, msg.as_string())
             logger.info(
                 "Notification sent: recipient=%s subject=%s", recipient, subject
             )
@@ -476,20 +571,15 @@ class EmailService:
 
 def build_html_message(waybill, event):
     """Generates the HTML payload for shipment notification emails."""
-    courier = event.get("Courier", "Unknown")
-    details = event.get("Details", "")
-    location = event.get("Location", "")
-    date = event.get("Date", "")
-    time = event.get("Time", "")
-    link = event.get("Link", "#")
+    courier = escape(event.get("Courier", "Unknown"))
+    details = escape(event.get("Details", ""))
+    location = escape(event.get("Location", ""))
+    date = escape(event.get("Date", ""))
+    time = escape(event.get("Time", ""))
+    link = escape(event.get("Link", "#"), quote=True)
+    safe_waybill = escape(waybill)
 
-    del_txt = details.lower()
-    is_delivered = (
-        "delivered" in del_txt
-        and "failed" not in del_txt
-        and "unable" not in del_txt
-        and "out for delivery" not in del_txt
-    )
+    is_delivered = is_delivered_status(event.get("Details", ""))
 
     bg_charcoal = "#171717"
     card_bg = "#212121"
@@ -508,9 +598,7 @@ def build_html_message(waybill, event):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            @import url('https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;500&family=Inter:wght@400;500&display=swap');
-
-            body {{ margin: 0; padding: 0; font-family: 'Inter', sans-serif; background-color: {bg_charcoal}; color: {text_white}; -webkit-font-smoothing: antialiased; }}
+            body {{ margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background-color: {bg_charcoal}; color: {text_white}; -webkit-font-smoothing: antialiased; }}
             .wrapper {{ width: 100%; background-color: {bg_charcoal}; padding: 30px 0; }}
             .container {{ max-width: 520px; margin: 0 auto; padding: 0 15px; box-sizing: border-box; }}
             
@@ -526,7 +614,7 @@ def build_html_message(waybill, event):
             .header-info {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.2em; color: {text_muted}; margin-bottom: 24px; }}
 
             .main-status {{ 
-                font-family: 'Source Serif 4', serif; 
+                font-family: Georgia, 'Times New Roman', serif; 
                 font-size: 32px; 
                 line-height: 1.15; 
                 color: {accent_sand}; 
@@ -588,7 +676,7 @@ def build_html_message(waybill, event):
                     <div class="data-grid">
                         <div class="data-item">
                             <span class="data-label">Reference</span>
-                            <span class="data-value">{waybill}</span>
+                            <span class="data-value">{safe_waybill}</span>
                         </div>
                         <div class="data-item">
                             <span class="data-label">Update Time</span>
@@ -606,11 +694,30 @@ def build_html_message(waybill, event):
     """
 
 
+def is_delivered_status(details):
+    """Determines whether a shipment event should be treated as delivered."""
+    del_txt = details.lower()
+    return (
+        "delivered" in del_txt
+        and "failed" not in del_txt
+        and "unable" not in del_txt
+        and "out for delivery" not in del_txt
+    )
+
+
+def is_valid_tracking_event(event):
+    """Checks whether a tracker returned the minimum expected event payload."""
+    if not isinstance(event, dict):
+        return False
+
+    return all(event.get(field) for field in Config.TRACKING_EVENT_FIELDS)
+
+
 def process_shipment(row, tracker, db, email_service, **kwargs):
     """Executes the tracking verification, status comparison, and notification logic for a single shipment."""
     waybill = row["waybill"]
     last_hash = row["last_event_hash"]
-    target_recipient = row["recipient_email"]
+    target_recipient = row["recipient_email"] or Config.RECIPIENT_EMAIL
     courier = row["courier"]
 
     logger.debug("Processing shipment: courier=%s waybill=%s", courier, waybill)
@@ -618,6 +725,13 @@ def process_shipment(row, tracker, db, email_service, **kwargs):
     if not event:
         logger.warning(
             "Failed to fetch tracking event: courier=%s waybill=%s", courier, waybill
+        )
+        return
+    if not is_valid_tracking_event(event):
+        logger.warning(
+            "Tracker returned invalid event payload: courier=%s waybill=%s",
+            courier,
+            waybill,
         )
         return
 
@@ -633,13 +747,7 @@ def process_shipment(row, tracker, db, email_service, **kwargs):
             target_recipient,
         )
 
-        del_txt = event["Details"].lower()
-        is_delivered = (
-            "delivered" in del_txt
-            and "failed" not in del_txt
-            and "unable" not in del_txt
-            and "out for delivery" not in del_txt
-        )
+        is_delivered = is_delivered_status(event["Details"])
 
         status_text = "Delivered" if is_delivered else "In Transit"
         subject = f"{status_text} | {event['Courier']} | {waybill}"
