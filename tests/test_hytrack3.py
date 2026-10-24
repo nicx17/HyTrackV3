@@ -72,7 +72,7 @@ def _install_import_stubs() -> None:
 
     if "dotenv" not in sys.modules:
         dotenv = types.ModuleType("dotenv")
-        setattr(dotenv, "load_dotenv", lambda: None)
+        setattr(dotenv, "load_dotenv", lambda *_a, **_k: None)
         sys.modules["dotenv"] = dotenv
 
 
@@ -287,11 +287,15 @@ class FakeMailClient:
 
 
 class FakeDb:
-    def __init__(self) -> None:
+    def __init__(self, active_for_sender: int = 0) -> None:
         self.records: list[tuple[str, str, str]] = []
+        self.active_for_sender = active_for_sender
 
     def add_waybill(self, waybill: str, courier: str, recipient_email: str) -> None:
         self.records.append((waybill, courier, recipient_email))
+
+    def count_active_for_sender(self, _recipient_email: str) -> int:
+        return self.active_for_sender + len(self.records)
 
 
 class EmailServiceFetchTests(ConfigPatchMixin, unittest.TestCase):
@@ -301,7 +305,7 @@ class EmailServiceFetchTests(ConfigPatchMixin, unittest.TestCase):
 
     def test_fetch_new_waybills_deduplicates_and_logs_out(self) -> None:
         msg = EmailMessage()
-        msg["From"] = "Sender <sender@example.com>"
+        msg["From"] = "Customer <customer@example.com>"
         msg.set_content(
             "Blue Dart 12345678901 and duplicate 12345678901 and Delhivery 123456789012"
         )
@@ -329,6 +333,15 @@ class EmailServiceFetchTests(ConfigPatchMixin, unittest.TestCase):
 
         self.assertEqual([], found)
         self.assertTrue(mail_client.logged_out)
+
+    def test_imap_connection_uses_timeout(self) -> None:
+        mail_client = FakeMailClient(("OK", [b""]), {})
+
+        with patch("Hytrack3.imaplib.IMAP4_SSL", return_value=mail_client) as imap_cls:
+            self.service.fetch_new_waybills(FakeDb())
+
+        self.assertEqual(Hytrack3.Config.IMAP_TIMEOUT, imap_cls.call_args.kwargs.get("timeout"))
+        self.assertGreater(Hytrack3.Config.IMAP_TIMEOUT, 0)
 
     def test_process_unseen_message_skips_bad_fetch_response(self) -> None:
         mail_client = FakeMailClient(("OK", [b"1"]), {b"1": ("NO", [])})
@@ -535,6 +548,303 @@ class ProcessShipmentTests(unittest.TestCase):
             )
         finally:
             Hytrack3.Config.RECIPIENT_EMAIL = original_recipient
+
+
+SAMPLE_EVENT = {
+    "Courier": "Blue Dart",
+    "Location": "Quepem",
+    "Details": "Shipment Arrived",
+    "Date": "18 Oct 2026",
+    "Time": "11:42",
+    "Link": "https://example.com/track",
+    "History": [
+        {"Location": "Quepem", "Details": "Shipment Arrived", "Date": "18 Oct 2026", "Time": "11:42"},
+        {"Location": "Goa Hub", "Details": "Shipment Further Connected", "Date": "18 Oct 2026", "Time": "05:03"},
+        {"Location": "Mumbai Hub", "Details": "Shipment Further Connected", "Date": "17 Oct 2026", "Time": "00:51"},
+        {"Location": "Pune", "Details": "Shipment Picked Up", "Date": "16 Oct 2026", "Time": "15:07"},
+    ],
+    "Meta": {"From": "Pune", "To": "Quepem", "Expected Delivery": "19 Oct 2026"},
+}
+
+
+class StatusClassificationTests(unittest.TestCase):
+    def test_undelivered_is_not_delivered(self) -> None:
+        self.assertFalse(Hytrack3.is_delivered_status("Shipment Undelivered - Consignee not available"))
+        self.assertFalse(Hytrack3.is_delivered_status("Not delivered, address incomplete"))
+        self.assertFalse(Hytrack3.is_delivered_status("Delivery attempted - premises closed"))
+
+    def test_classify_status(self) -> None:
+        self.assertEqual("delivered", Hytrack3.classify_status("SHIPMENT DELIVERED"))
+        self.assertEqual("out_for_delivery", Hytrack3.classify_status("Shipment Out For Delivery"))
+        self.assertEqual("exception", Hytrack3.classify_status("Shipment Undelivered"))
+        self.assertEqual("exception", Hytrack3.classify_status("Delivery failed"))
+        self.assertEqual("in_transit", Hytrack3.classify_status("Shipment Arrived"))
+
+
+class WaybillExtractionTests(unittest.TestCase):
+    def test_extracts_bare_waybills_by_length(self) -> None:
+        self.assertEqual(
+            [("90700845933", "BLUEDART"), ("6949210969776", "DELHIVERY")],
+            Hytrack3.extract_waybills("90700845933\n6949210969776"),
+        )
+
+    def test_ignores_phone_numbers(self) -> None:
+        text = (
+            "Please track 90700845933.\n"
+            "Call me on +919876543210 or 919876543210, mobile: 02212345678"
+        )
+        self.assertEqual([("90700845933", "BLUEDART")], Hytrack3.extract_waybills(text))
+
+    def test_accepts_phone_shaped_number_with_courier_keyword(self) -> None:
+        self.assertEqual(
+            [("919876543210", "DELHIVERY")],
+            Hytrack3.extract_waybills("Delhivery AWB: 919876543210"),
+        )
+
+    def test_ignores_longer_digit_runs_and_deduplicates(self) -> None:
+        text = "Order 1234567890123456 / 90700845933 / 90700845933"
+        self.assertEqual([("90700845933", "BLUEDART")], Hytrack3.extract_waybills(text))
+
+
+class SenderTrustTests(ConfigPatchMixin, unittest.TestCase):
+    def _msg(self, sender: str = "Alice <alice@example.com>", **headers: str) -> EmailMessage:
+        msg = EmailMessage()
+        msg["From"] = sender
+        for key, value in headers.items():
+            msg[key.replace("_", "-")] = value
+        msg.set_content("90700845933")
+        return msg
+
+    def test_accepts_normal_sender(self) -> None:
+        self.assertTrue(Hytrack3.is_trusted_sender(self._msg(), "alice@example.com"))
+
+    def test_rejects_bounces_auto_replies_and_self(self) -> None:
+        self.assertFalse(
+            Hytrack3.is_trusted_sender(self._msg("MAILER-DAEMON@example.com"), "mailer-daemon@example.com")
+        )
+        self.assertFalse(
+            Hytrack3.is_trusted_sender(self._msg(Auto_Submitted="auto-replied"), "alice@example.com")
+        )
+        self.assertFalse(Hytrack3.is_trusted_sender(self._msg(), "sender@example.com"))
+
+    def test_rejects_failed_authentication(self) -> None:
+        msg = self._msg(Authentication_Results="mx.example.com; spf=fail smtp.mailfrom=x; dmarc=fail")
+        self.assertFalse(Hytrack3.is_trusted_sender(msg, "alice@example.com"))
+
+    def test_accepts_when_any_authentication_passes(self) -> None:
+        msg = self._msg(Authentication_Results="mx.example.com; spf=softfail; dkim=pass header.d=example.com")
+        self.assertTrue(Hytrack3.is_trusted_sender(msg, "alice@example.com"))
+
+
+class IngestionLimitTests(ConfigPatchMixin, unittest.TestCase):
+    def _run(self, body: str, db: FakeDb, sender: str = "Sender <sender2@example.com>") -> FakeMailClient:
+        msg = EmailMessage()
+        msg["From"] = sender
+        msg["Subject"] = "track"
+        msg.set_content(body)
+        mail_client = FakeMailClient(("OK", [b"1"]), {b"1": ("OK", [(b"1", msg.as_bytes())])})
+        with patch("Hytrack3.imaplib.IMAP4_SSL", return_value=mail_client):
+            Hytrack3.EmailService().fetch_new_waybills(db)
+        return mail_client
+
+    def test_caps_waybills_per_message(self) -> None:
+        body = " ".join(str(90700845900 + i) for i in range(30))
+        db = FakeDb()
+        self._run(body, db)
+        self.assertEqual(Hytrack3.Config.MAX_WAYBILLS_PER_EMAIL, len(db.records))
+
+    def test_respects_active_cap_per_sender(self) -> None:
+        db = FakeDb(active_for_sender=Hytrack3.Config.MAX_ACTIVE_PER_SENDER)
+        mail_client = self._run("90700845933", db)
+        self.assertEqual([], db.records)
+        self.assertIn(b"1", mail_client.stored)
+
+    def test_reads_waybill_from_subject(self) -> None:
+        msg = EmailMessage()
+        msg["From"] = "Sender <sender2@example.com>"
+        msg["Subject"] = "90700845933"
+        msg.set_content("thanks!")
+        mail_client = FakeMailClient(("OK", [b"1"]), {b"1": ("OK", [(b"1", msg.as_bytes())])})
+        db = FakeDb()
+        with patch("Hytrack3.imaplib.IMAP4_SSL", return_value=mail_client):
+            Hytrack3.EmailService().fetch_new_waybills(db)
+        self.assertEqual([("90700845933", "BLUEDART", "sender2@example.com")], db.records)
+
+    def test_untrusted_sender_is_marked_seen_but_ignored(self) -> None:
+        db = FakeDb()
+        mail_client = self._run("90700845933", db, sender="Mail Delivery <mailer-daemon@example.com>")
+        self.assertEqual([], db.records)
+        self.assertIn(b"1", mail_client.stored)
+
+
+class NotificationDeliveryTests(ConfigPatchMixin, unittest.TestCase):
+    def test_send_notification_reports_success_and_failure(self) -> None:
+        smtp_client = MagicMock()
+        smtp_client.__enter__.return_value = smtp_client
+        smtp_client.has_extn.return_value = True
+        with patch("Hytrack3.smtplib.SMTP", return_value=smtp_client):
+            self.assertTrue(Hytrack3.EmailService().send_notification("b@example.com", "S", "<p>x</p>", "x"))
+
+        smtp_client.sendmail.side_effect = OSError("boom")
+        with patch("Hytrack3.smtplib.SMTP", return_value=smtp_client):
+            self.assertFalse(Hytrack3.EmailService().send_notification("b@example.com", "S", "<p>x</p>", "x"))
+
+    def test_send_notification_includes_plain_text_part(self) -> None:
+        smtp_client = MagicMock()
+        smtp_client.__enter__.return_value = smtp_client
+        smtp_client.has_extn.return_value = True
+        with patch("Hytrack3.smtplib.SMTP", return_value=smtp_client):
+            Hytrack3.EmailService().send_notification("b@example.com", "S", "<p>x</p>", "plain body")
+        raw = smtp_client.sendmail.call_args.args[2]
+        self.assertIn("text/plain", raw)
+        self.assertIn("text/html", raw)
+
+    def test_failed_send_does_not_store_new_state(self) -> None:
+        row = {"waybill": "90700845933", "last_event_hash": None, "recipient_email": "a@example.com", "courier": "BLUEDART"}
+        tracker = SimpleNamespace(fetch_latest_event=MagicMock(return_value=dict(SAMPLE_EVENT)))
+        db = SimpleNamespace(update_shipment=MagicMock())
+        email_service = SimpleNamespace(send_notification=MagicMock(return_value=False))
+
+        Hytrack3.process_shipment(row, tracker, db, email_service)
+
+        email_service.send_notification.assert_called_once()
+        db.update_shipment.assert_not_called()
+
+
+class ExpiryTests(unittest.TestCase):
+    def test_expires_never_found_and_idle_shipments_and_readd_revives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with Hytrack3.DatabaseManager(os.path.join(temp_dir, "t.db")) as db:
+                db.setup()
+                db.add_waybill("11111111111", "BLUEDART", "a@example.com")  # never found
+                db.add_waybill("22222222222", "BLUEDART", "a@example.com")  # idle
+                db.add_waybill("33333333333", "BLUEDART", "a@example.com")  # fresh
+                db.update_shipment("22222222222", "somehash")
+                conn = db._get_connection()
+                conn.execute("UPDATE shipments SET last_updated = datetime('now', '-8 days') WHERE waybill = '11111111111'")
+                conn.execute("UPDATE shipments SET last_updated = datetime('now', '-31 days') WHERE waybill = '22222222222'")
+                conn.commit()
+
+                self.assertEqual(2, db.expire_stale_shipments(unfound_days=7, idle_days=30))
+                self.assertEqual(["33333333333"], [r["waybill"] for r in db.get_active_shipments()])
+                self.assertEqual(1, db.count_active_for_sender("a@example.com"))
+
+                db.add_waybill("11111111111", "BLUEDART", "a@example.com")
+                self.assertEqual(2, len(db.get_active_shipments()))
+
+    def test_setup_migrates_old_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "old.db")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE shipments (waybill TEXT PRIMARY KEY, courier TEXT, last_event_hash TEXT,"
+                " is_delivered INTEGER NOT NULL DEFAULT 0, last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+            conn.execute("INSERT INTO shipments (waybill, courier) VALUES ('90700845933', 'BLUEDART')")
+            conn.commit()
+            conn.close()
+
+            with Hytrack3.DatabaseManager(path) as db:
+                db.setup()
+                self.assertEqual(1, len(db.get_active_shipments()))
+
+
+class RunLockTests(unittest.TestCase):
+    def test_second_lock_is_refused_until_released(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "run.lock")
+            first = Hytrack3.acquire_run_lock(path)
+            self.assertIsNotNone(first)
+            self.assertIsNone(Hytrack3.acquire_run_lock(path))
+            first.close()
+            again = Hytrack3.acquire_run_lock(path)
+            self.assertIsNotNone(again)
+            again.close()
+
+
+class LoggingSetupTests(unittest.TestCase):
+    def test_import_does_not_attach_file_handlers(self) -> None:
+        import logging as std_logging
+
+        handlers = std_logging.getLogger().handlers + Hytrack3.logger.handlers
+        self.assertFalse(any(isinstance(h, std_logging.FileHandler) for h in handlers))
+
+
+class BlueDartHistoryTests(unittest.TestCase):
+    def test_parses_full_history_and_shipment_meta(self) -> None:
+        html = """
+        <div id="SHIP90700845933"><table><tbody>
+          <tr><th>Waybill No</th><td>90700845933</td></tr>
+          <tr><th>From </th><td>Pune</td></tr>
+          <tr><th>To </th><td>Quepem</td></tr>
+          <tr><th>Expected Date of Delivery </th><td>19 Oct 2026</td></tr>
+        </tbody></table></div>
+        <div id="SCAN90700845933"><table><thead><tr><th>Location</th></tr></thead><tbody>
+          <tr><td>Quepem</td><td>Shipment Arrived </td><td>18 Oct 2026</td><td>11:42</td></tr>
+          <tr><td>Goa  Hub</td><td>Shipment Further Connected </td><td>18 Oct 2026</td><td>05:03</td></tr>
+          <tr><td>Pune</td><td>Shipment Picked Up</td><td>16 Oct 2026</td><td>15:07</td></tr>
+        </tbody></table></div>
+        """
+        session = MagicMock()
+        session.get.return_value = SimpleNamespace(status_code=200, text=html)
+
+        event = Hytrack3.BlueDartTracker("90700845933", session=session).fetch_latest_event()
+
+        self.assertIsNotNone(event)
+        self.assertEqual("Shipment Arrived", event["Details"])
+        self.assertEqual(3, len(event["History"]))
+        self.assertEqual("Pune", event["History"][-1]["Location"])
+        self.assertEqual("Goa Hub", event["History"][1]["Location"])
+        self.assertEqual(
+            {"From": "Pune", "To": "Quepem", "Expected Delivery": "19 Oct 2026"}, event["Meta"]
+        )
+
+
+class DelhiveryTimelineTests(unittest.TestCase):
+    def test_parse_timeline_date(self) -> None:
+        self.assertEqual(("18 Oct", "11:42 am"), Hytrack3.parse_timeline_datetime("Reached\n18 Oct, 11:42 am"))
+        self.assertEqual(("Sat, 18 Oct", "5:03 PM"), Hytrack3.parse_timeline_datetime("Sat, 18 Oct 5:03 PM in Goa"))
+        self.assertEqual(("", ""), Hytrack3.parse_timeline_datetime("no timestamp here"))
+
+
+class EmailDesignTests(unittest.TestCase):
+    def test_html_renders_journey_log_newest_first_with_current_marker(self) -> None:
+        html = Hytrack3.build_html_message("90700845933", dict(SAMPLE_EVENT))
+        self.assertIn("Journey log", html)
+        for place in ("Quepem", "Goa Hub", "Mumbai Hub", "Pune"):
+            self.assertIn(place, html)
+        self.assertLess(html.index("Goa Hub"), html.index("Mumbai Hub"))
+        self.assertEqual(1, html.count('data-current="true"'))
+        self.assertIn("19 Oct 2026", html)
+        self.assertIn("nickcardoso.com", html)
+
+    def test_html_without_history_still_shows_latest_event(self) -> None:
+        event = {k: v for k, v in SAMPLE_EVENT.items() if k not in ("History", "Meta")}
+        html = Hytrack3.build_html_message("90700845933", event)
+        self.assertIn("Shipment Arrived", html)
+        self.assertEqual(1, html.count('data-current="true"'))
+
+    def test_html_truncates_long_history(self) -> None:
+        event = dict(SAMPLE_EVENT)
+        event["History"] = [
+            {"Location": f"Hub {i}", "Details": "Moved", "Date": "1 Oct 2026", "Time": "10:00"} for i in range(20)
+        ]
+        html = Hytrack3.build_html_message("90700845933", event)
+        self.assertIn("Hub 0", html)
+        self.assertNotIn("Hub 19<", html)
+        self.assertIn("earlier", html)
+
+    def test_delivered_email_hides_expected_delivery(self) -> None:
+        event = dict(SAMPLE_EVENT, Details="Shipment Delivered")
+        html = Hytrack3.build_html_message("90700845933", event)
+        self.assertNotIn("19 Oct 2026", html)
+        self.assertIn("Delivered", html)
+
+    def test_plain_text_version(self) -> None:
+        text = Hytrack3.build_text_message("90700845933", dict(SAMPLE_EVENT))
+        self.assertIn("Shipment Arrived", text)
+        self.assertIn("Goa Hub", text)
+        self.assertIn("https://example.com/track", text)
 
 
 if __name__ == "__main__":

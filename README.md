@@ -2,7 +2,7 @@
 
 ![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge&logo=activity&logoColor=white)
 ![GitHub Release](https://img.shields.io/github/v/release/nicx17/HyTrackV3?include_prereleases&style=for-the-badge&logo=github&color=FF90C3)
-![Python](https://img.shields.io/badge/Python_3.8+-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python_3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Selenium](https://img.shields.io/badge/Selenium-43B02A?style=for-the-badge&logo=selenium&logoColor=white)
 ![License](https://img.shields.io/github/license/nicx17/HyTrackV3?style=for-the-badge&color=007EC6)
 
@@ -22,12 +22,13 @@ The system will ingest your tracking number, start monitoring the package, and s
 
 Here is what the automated status updates look like:
 
+Each update shows the current status, the route and expected delivery date, and a **journey log** of the latest scans, styled to match [nickcardoso.com](https://nickcardoso.com).
+
 <p align="center">
-  <img src="assets/delivered_delhivery.png" width="45%" alt="Delivered Status (Delhivery)" />
-  <img src="assets/out_for_delivery_delhivery.png" width="45%" alt="Out for Delivery" />
+  <img src="assets/email_in_transit.png" width="48%" alt="In-transit update with journey log" />
+  <img src="assets/email_delivered.png" width="48%" alt="Delivered update" />
   <br>
-  <img src="assets/on_the_way.png" width="45%" alt="In Transit" />
-  <img src="assets/delivered_bluedart.png" width="45%" alt="Delivered Status (Blue Dart)" />
+  <img src="assets/email_mobile.png" width="30%" alt="Update on a phone" />
 </p>
 
 ## Features
@@ -40,13 +41,15 @@ Here is what the automated status updates look like:
     -   Uses headless Chrome for dynamic content.
     -   Handles session management and retries for robust fetching.
 -   **Database Persistence**: Maintains a local SQLite database (`hytrack3.db`) to track shipment history and avoid duplicate processing.
--   **Automated Notifications**: Sends HTML-formatted email updates whenever a shipment status changes.
+-   **Automated Notifications**: Sends HTML (with a plain-text fallback) email updates whenever a shipment status changes, including a journey log of recent scans. A notification that fails to send is retried on the next run.
+-   **Careful Ingestion**: Reads waybills from the subject and body, skips numbers that look like phone numbers, ignores bounces, auto-replies and mail that fails SPF/DKIM/DMARC, and caps waybills per email and per sender.
+-   **Self-Maintaining**: Stops tracking waybills that never resolve or stop changing, rotates its log file, and skips a run if the previous one is still going.
 
 ## Prerequisites
 
 Before running HyTrackV3 locally, ensure you have the following installed:
 
--   **Python 3.8+**
+-   **Python 3.10+**
 -   **Google Chrome** (latest stable version)
 -   **Git**
 

@@ -15,6 +15,21 @@ HyTrackV3 uses environment variables for configuration. Create a `.env` file in 
 | `RECIPIENT_EMAIL` | Email address to receive status updates. | `user@example.com` |
 | `LOG_LEVEL` | Logging verbosity (DEBUG, INFO, WARNING, ERROR). | `INFO` |
 
+## Optional Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SMTP_TIMEOUT` | Seconds to wait on the SMTP server. | `30` |
+| `IMAP_TIMEOUT` | Seconds to wait on the IMAP server before giving up until the next run. | `60` |
+| `LOG_MAX_BYTES` | Size at which `hytrack3.log` is rotated. | `5242880` (5 MB) |
+| `LOG_BACKUP_COUNT` | Rotated log files to keep (`hytrack3.log.1` ...). | `3` |
+| `MAX_WAYBILLS_PER_EMAIL` | Waybills accepted from a single email. | `10` |
+| `MAX_ACTIVE_PER_SENDER` | Shipments tracked at once for one sender. | `25` |
+| `UNFOUND_EXPIRY_DAYS` | Stop tracking a waybill the courier never recognised after this many days. | `7` |
+| `IDLE_EXPIRY_DAYS` | Stop tracking a shipment whose status hasn't changed for this many days. | `30` |
+
+Emailing an expired waybill again resumes tracking it.
+
 ## Setting up Gmail
 
 1.  **Enable IMAP**: Go to Gmail Settings > Forwarding and POP/IMAP > Enable IMAP.
@@ -26,8 +41,10 @@ HyTrackV3 uses environment variables for configuration. Create a `.env` file in 
 
 ## Multiple Couriers
 
-The regex patterns for detecting tracking numbers are defined in `Hytrack3.py`.
-- **Blue Dart**: looks for 11-digit numbers.
-- **Delhivery**: looks for 12-14 digit numbers.
+Waybills are detected by `extract_waybills` in `Hytrack3.py`, from the email subject and body:
+- **Blue Dart**: 11-digit numbers.
+- **Delhivery**: 12-14 digit numbers.
 
-If you need to add more couriers, you will need to modify the `REGEX_*` constants and the `process_shipment` logic in `Hytrack3.py`.
+Numbers shaped like phone numbers (`91` + a 10-digit mobile, or a leading `0`), or preceded by words like "phone" or "call", are skipped unless a courier word ("AWB", "waybill", "tracking", "Blue Dart", "Delhivery") appears just before them.
+
+If you need to add more couriers, add a tracker class, extend `extract_waybills`, and add a processing phase in `run_tracker`.
